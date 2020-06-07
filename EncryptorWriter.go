@@ -10,10 +10,12 @@ import (
 )
 
 type V struct {
-	buf      []byte
-	wholeBuf []byte
-	enc      cipher.BlockMode
-	out      io.Writer
+	buf         []byte
+	wholeBuf    []byte
+	enc         cipher.BlockMode
+	out         io.Writer
+	bufsToRekey int
+	publicKey   rsa.PublicKey
 }
 
 func appendData(buf []byte, data []byte) (newBuf []byte, remains []byte) {
@@ -43,6 +45,22 @@ func pad(data []byte, blockSize int) ([]byte, error) {
 }
 
 func Create(pk rsa.PublicKey, out io.Writer) *V {
+	v := V{
+		publicKey: pk,
+		out:       out,
+	}
+
+	v.rekey()
+
+	b := make([]byte, v.enc.BlockSize()*256)[0:0]
+
+	v.buf = b
+	v.wholeBuf = b
+
+	return &v
+}
+
+func (v *V) rekey() {
 	rng := rand.Reader
 
 	r := make([]byte, 180)
@@ -50,30 +68,33 @@ func Create(pk rsa.PublicKey, out io.Writer) *V {
 		panic("RNG failure")
 	}
 
-	encryptedKey, _ := rsa.EncryptOAEP(sha256.New(), rng, &pk, r, nil)
+	r[49] = 30 ^ r[50] // Rekey every 1 GB (1<<30)
 
-	_, _ = out.Write(encryptedKey)
+	encryptedKey, _ := rsa.EncryptOAEP(sha256.New(), rng, &v.publicKey, r, nil)
+
+	_, _ = v.out.Write(encryptedKey)
 
 	key := r[0:32]
 	iv := r[32:48]
 	c, _ := aes.NewCipher(key)
 
-	enc := cipher.NewCBCEncrypter(c, iv)
-
-	b := make([]byte, enc.BlockSize()*256)[0:0]
-
-	return &V{
-		buf:      b,
-		wholeBuf: b,
-		enc:      enc,
-		out:      out,
-	}
+	v.enc = cipher.NewCBCEncrypter(c, iv)
+	v.bufsToRekey = 256 * 1024 // 1Gb
 }
 
 func (v *V) Write(p []byte) (n int, err error) {
 	remains := p
 
 	for remains != nil {
+
+		if v.bufsToRekey == 0 {
+			padded, _ := pad(v.buf, v.enc.BlockSize())
+			v.enc.CryptBlocks(padded, padded)
+			_, _ = v.out.Write(padded)
+
+			v.rekey()
+		}
+
 		v.buf, remains = appendData(v.buf, remains)
 
 		if len(v.buf) == cap(v.buf) {
@@ -83,6 +104,7 @@ func (v *V) Write(p []byte) (n int, err error) {
 				return 0, err
 			}
 			v.buf = v.wholeBuf
+			v.bufsToRekey--
 		}
 	}
 
