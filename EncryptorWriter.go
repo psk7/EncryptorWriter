@@ -6,12 +6,14 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"encoding/hex"
 	"io"
 )
 
 type V struct {
 	buf         []byte
 	wholeBuf    []byte
+	keyId       []byte
 	enc         cipher.BlockMode
 	out         io.Writer
 	bufsToRekey int
@@ -44,10 +46,13 @@ func pad(data []byte, blockSize int) ([]byte, error) {
 	return data, nil
 }
 
-func Create(pk rsa.PublicKey, out io.Writer) *V {
+func Create(pk rsa.PublicKey, out io.Writer, keyId string) *V {
+	sh, _ := hex.DecodeString(keyId)
+
 	v := V{
 		publicKey: pk,
 		out:       out,
+		keyId:     sh,
 	}
 
 	v.rekey()
@@ -63,12 +68,20 @@ func Create(pk rsa.PublicKey, out io.Writer) *V {
 func (v *V) rekey() {
 	rng := rand.Reader
 
-	r := make([]byte, 180)
+	r := make([]byte, 181)
 	if _, err := io.ReadFull(rng, r); err != nil {
 		panic("RNG failure")
 	}
 
-	r[49] = 30 ^ r[50] // Rekey every 1 GB (1<<30)
+	salt := r[50]
+
+	r[49] = 30 ^ salt                 // Rekey every 1 GB (1<<30)
+	r[51] = 1 ^ salt                  // Info version
+	r[52] = byte(len(v.keyId)) ^ salt // keyId length
+
+	for idx, el := range v.keyId {
+		r[53+idx] = el & salt
+	}
 
 	encryptedKey, _ := rsa.EncryptOAEP(sha256.New(), rng, &v.publicKey, r, nil)
 
